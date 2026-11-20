@@ -6,7 +6,6 @@ import inspect
 import json
 import logging
 import re
-import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -80,12 +79,6 @@ class LLMError(Exception):
 
 def sse(payload: dict[str, Any]) -> str:
     return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
-
-
-def get_helper_model() -> str:
-    """Model for short helper calls (suggestions, memory): the fallback model if set, else the primary."""
-    settings = get_settings()
-    return settings.FALLBACK_MODEL or settings.GEMMA_MODEL
 
 
 def get_genai_client() -> genai.Client:
@@ -200,15 +193,13 @@ async def _stream_model_text(contents: list[Any], user_name: str | None = None) 
         system_instruction=system_instruction_for(user_name),
         temperature=0.3,
     )
-    delay = 0.5
+    delay = 1.0
     emitted = False
     for attempt in range(4):
-        # First try the primary model; after a 429/5xx switch to the fallback model (if configured).
-        model = settings.GEMMA_MODEL if attempt == 0 or not settings.FALLBACK_MODEL else settings.FALLBACK_MODEL
         try:
             stream = await _await_maybe(
                 client.aio.models.generate_content_stream(
-                    model=model,
+                    model=settings.GEMMA_MODEL,
                     contents=contents,
                     config=config,
                 )
@@ -222,9 +213,9 @@ async def _stream_model_text(contents: list[Any], user_name: str | None = None) 
             return
         except Exception as exc:
             if emitted or not is_retryable(exc) or attempt >= 3:
-                logger.warning("gemini stream failed model=%s status=%s", model, _status_of(exc))
+                logger.warning("gemini stream failed status=%s", _status_of(exc))
                 raise LLMError("AURIX AI is busy right now. Please try again in a moment.") from exc
-            logger.warning("gemini stream retry attempt=%s model=%s status=%s", attempt + 1, model, _status_of(exc))
+            logger.warning("gemini stream retry attempt=%s status=%s", attempt + 1, _status_of(exc))
             await asyncio.sleep(delay)
             delay *= 2
 
@@ -245,7 +236,7 @@ async def _suggestion_text(question: str, answer: str) -> str:
     async def _call() -> str:
         result = await _await_maybe(
             client.aio.models.generate_content(
-                model=get_helper_model(),
+                model=settings.GEMMA_MODEL,
                 contents=contents,
                 config=config,
             )
@@ -435,8 +426,6 @@ async def iter_chat_sse(
     from app.db import get_conversation_for_user
     from app.services.memory import extract_and_store_memories
 
-    t_start = time.perf_counter()
-
     conversation = await get_conversation_for_user(session, conversation_id, user_id)
     if conversation is None:
         yield sse({"type": "error", "message": "Conversation not found"})
@@ -489,12 +478,8 @@ async def iter_chat_sse(
     await session.commit()
 
     pieces: list[str] = []
-    t_prep = time.perf_counter()
-    t_first: float | None = None
     try:
         async for text in _stream_model_text(contents, user_name):
-            if t_first is None:
-                t_first = time.perf_counter()
             pieces.append(text)
             yield sse({"type": "token", "text": text})
     except LLMError as exc:
@@ -534,7 +519,6 @@ async def iter_chat_sse(
         )
         return
 
-    t_answer = time.perf_counter()
     # Send "done" right away so the UI unlocks as soon as the answer is complete.
     yield sse(
         {
@@ -546,16 +530,6 @@ async def iter_chat_sse(
     )
     # Start memory extraction before the suggestions call so it survives a client disconnect.
     db.spawn_background(extract_and_store_memories(user_id, message, answer))
-    t_done = time.perf_counter()
     suggestions = await fetch_suggestions(message, answer)
-    logger.info(
-        "chat timing prep_ms=%d first_token_ms=%d answer_ms=%d save_ms=%d suggestions_ms=%d file_mode=%s",
-        (t_prep - t_start) * 1000,
-        ((t_first or t_prep) - t_prep) * 1000,
-        (t_answer - (t_first or t_prep)) * 1000,
-        (t_done - t_answer) * 1000,
-        (time.perf_counter() - t_done) * 1000,
-        file_mode,
-    )
     if suggestions:
         yield sse({"type": "suggestions", "suggestions": suggestions})
