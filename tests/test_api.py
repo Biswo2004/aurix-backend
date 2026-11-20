@@ -371,3 +371,41 @@ def test_first_name_is_sanitised_for_the_prompt() -> None:
     assert first_name(None) is None
     assert "Hello Biswojit!" in system_instruction_for("Biswojit Bal")
     assert "first name" not in system_instruction_for(None)
+
+
+@pytest.mark.asyncio
+async def test_stream_fails_over_to_fallback_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.config import get_settings
+    from app.services import llm
+
+    class Overloaded(Exception):
+        status_code = 503
+
+    class Chunk:
+        def __init__(self, text: str) -> None:
+            part = type("Part", (), {"text": text, "thought": False})()
+            content = type("Content", (), {"parts": [part]})()
+            self.candidates = [type("Cand", (), {"content": content})()]
+
+    used: list[str] = []
+
+    class Models:
+        async def generate_content_stream(self, model, contents, config):
+            used.append(model)
+            if model == "primary-m":
+                raise Overloaded("503 UNAVAILABLE")
+
+            async def gen():
+                yield Chunk("ok from fallback")
+
+            return gen()
+
+    fake = type("Client", (), {"aio": type("Aio", (), {"models": Models()})()})()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "GEMMA_MODEL", "primary-m")
+    monkeypatch.setattr(settings, "FALLBACK_MODEL", "fallback-m")
+    monkeypatch.setattr(llm, "get_genai_client", lambda: fake)
+    out = "".join([piece async for piece in llm._stream_model_text([], None)])
+    assert out == "ok from fallback"
+    assert used == ["primary-m", "fallback-m"]
+    assert llm.get_helper_model() == "fallback-m"
