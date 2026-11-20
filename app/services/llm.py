@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import re
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -426,6 +427,8 @@ async def iter_chat_sse(
     from app.db import get_conversation_for_user
     from app.services.memory import extract_and_store_memories
 
+    t_start = time.perf_counter()
+
     conversation = await get_conversation_for_user(session, conversation_id, user_id)
     if conversation is None:
         yield sse({"type": "error", "message": "Conversation not found"})
@@ -478,8 +481,12 @@ async def iter_chat_sse(
     await session.commit()
 
     pieces: list[str] = []
+    t_prep = time.perf_counter()
+    t_first: float | None = None
     try:
         async for text in _stream_model_text(contents, user_name):
+            if t_first is None:
+                t_first = time.perf_counter()
             pieces.append(text)
             yield sse({"type": "token", "text": text})
     except LLMError as exc:
@@ -519,6 +526,7 @@ async def iter_chat_sse(
         )
         return
 
+    t_answer = time.perf_counter()
     # Send "done" right away so the UI unlocks as soon as the answer is complete.
     yield sse(
         {
@@ -530,6 +538,16 @@ async def iter_chat_sse(
     )
     # Start memory extraction before the suggestions call so it survives a client disconnect.
     db.spawn_background(extract_and_store_memories(user_id, message, answer))
+    t_done = time.perf_counter()
     suggestions = await fetch_suggestions(message, answer)
+    logger.info(
+        "chat timing prep_ms=%d first_token_ms=%d answer_ms=%d save_ms=%d suggestions_ms=%d file_mode=%s",
+        (t_prep - t_start) * 1000,
+        ((t_first or t_prep) - t_prep) * 1000,
+        (t_answer - (t_first or t_prep)) * 1000,
+        (t_done - t_answer) * 1000,
+        (time.perf_counter() - t_done) * 1000,
+        file_mode,
+    )
     if suggestions:
         yield sse({"type": "suggestions", "suggestions": suggestions})
