@@ -95,6 +95,11 @@ To deploy without Docker, use a Python 3.11+ native runtime instead:
 - Build command: `pip install -r requirements.txt`
 - Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 
+Copy each file to the same path in your repo (backend/ -> backend repo, frontend/ -> frontend repo).
+Delete the stray flat files at the repo roots: chat.py groq.py llm.py schemas.py test_api.py (backend) and
+ChatApp.tsx CitationPanel.tsx api.ts api.test.ts greeting.ts greeting.test.ts (frontend).
+
+
 ## Request flow
 
 1. The caller presents a Supabase access token. The API caches the JWKS from `{SUPABASE_URL}/auth/v1/.well-known/jwks.json` and checks the signature, expiry, and audience.
