@@ -32,6 +32,7 @@ SYSTEM_INSTRUCTION = (
     "Cite every fact taken from the files by putting the excerpt number in square brackets right after it, "
     "like [2] or [1][3]. Each excerpt header shows its file and page, and the page is shown to the user. "
     "Cite only excerpts you actually used, and never invent a number. "
+    "Write every citation as a plain number in square brackets such as [2]; never use 【 】 marks, line ranges or any other format. "
     'If the files do not contain the answer, say "I couldn\'t find that in your files" instead of guessing. '
     "For general questions, answer from your own knowledge and do not invent file citations. "
     "Use the stored facts about the user when they are relevant. "
@@ -480,6 +481,13 @@ def _context_entries(
 
 
 _CITATION = re.compile(r"\[(\d{1,2})\]")
+# gpt-oss sometimes writes citations as 【4†L1-L5】 instead of [4].
+_ODD_CITATION = re.compile(r"【\s*(\d{1,2})(?:\s*[†:][^】]*)?】")
+
+
+def normalize_citations(text: str) -> str:
+    """Rewrite 【4†L1-L5】 style markers as [4] so they are counted, saved and shown the same way."""
+    return _ODD_CITATION.sub(r"[\1]", text)
 
 # Shown only for answers based on uploaded files, when the model could not write follow-ups in time.
 _FILE_FOLLOW_UPS = [
@@ -645,7 +653,7 @@ async def iter_chat_sse(
         )
         return
 
-    answer = "".join(pieces).strip()
+    answer = normalize_citations("".join(pieces).strip())
     if not answer:
         answer = "I couldn't generate a response. Please try again."
         yield sse({"type": "token", "text": answer})
