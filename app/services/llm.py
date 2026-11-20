@@ -29,7 +29,9 @@ logger = logging.getLogger(__name__)
 SYSTEM_INSTRUCTION = (
     "You are AURIX AI, a helpful and honest assistant. "
     "When the question is about the user's uploaded files, answer from the provided file context. "
-    "Cite those sources as [1], [2], matching the numbered excerpts. "
+    "Cite every fact taken from the files by putting the excerpt number in square brackets right after it, "
+    "like [2] or [1][3]. Each excerpt header shows its file and page, and the page is shown to the user. "
+    "Cite only excerpts you actually used, and never invent a number. "
     'If the files do not contain the answer, say "I couldn\'t find that in your files" instead of guessing. '
     "For general questions, answer from your own knowledge and do not invent file citations. "
     "Use the stored facts about the user when they are relevant. "
@@ -325,13 +327,18 @@ async def _suggestion_text(question: str, answer: str) -> str:
 
 
 async def helper_generate(client: Any, contents: str, instruction: str, temperature: float) -> str:
-    """Short helper call: light model, then Groq (if configured), then the other models once each. No retry chain."""
+    """Short helper call: Groq first when it is the primary model, then the light model, then others once each."""
     settings = get_settings()
-    models = [get_helper_model()]
     candidates = [settings.primary_model, *settings.fallback_models]
     groq_models = [m for m in candidates if groq_service.is_groq_model(m)]
+    models: list[str] = []
+    if settings.GROQ_API_KEY and groq_models and groq_service.is_groq_model(settings.primary_model):
+        models.append(groq_models[0])  # the primary is Groq: it is also the fastest choice for short helper calls
+    light = get_helper_model()
+    if light not in models:
+        models.append(light)
     if settings.GROQ_API_KEY and groq_models and groq_models[0] not in models:
-        models.append(groq_models[0])  # fast second choice, so follow-up chips appear even if Google is slow
+        models.append(groq_models[0])
     for extra in candidates:
         if extra not in models and not groq_service.is_groq_model(extra) and len(models) < 3:
             models.append(extra)
@@ -371,7 +378,7 @@ async def fetch_suggestions(question: str, answer: str) -> list[str]:
         raw = await asyncio.wait_for(_suggestion_text(question, answer), timeout=15)
         return extract_json_array(raw)[:3]
     except Exception as exc:
-        logger.info("suggestions skipped: %s", exc.__class__.__name__)
+        logger.warning("suggestions skipped: %s %s", exc.__class__.__name__, str(exc)[:160])
         return []
 
 
@@ -470,6 +477,25 @@ def _context_entries(
         )
         index += 1
     return "\n\n".join(blocks), sources
+
+
+_CITATION = re.compile(r"\[(\d{1,2})\]")
+
+# Shown only for answers based on uploaded files, when the model could not write follow-ups in time.
+_FILE_FOLLOW_UPS = [
+    "Summarize the key points",
+    "Which pages cover this in detail?",
+    "Explain this in simpler words",
+]
+
+
+def _cited_sources(answer: str, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only the excerpts the answer cites. If it cites none, keep the three best matches."""
+    if not sources:
+        return sources
+    cited = {int(n) for n in _CITATION.findall(answer)}
+    kept = [src for src in sources if src["index"] in cited]
+    return kept or sources[:3]
 
 
 def _user_prompt(
@@ -624,6 +650,7 @@ async def iter_chat_sse(
         answer = "I couldn't generate a response. Please try again."
         yield sse({"type": "token", "text": answer})
 
+    sources = _cited_sources(answer, sources)
     try:
         assistant = await _save_turn(
             session,
@@ -666,5 +693,7 @@ async def iter_chat_sse(
         (time.perf_counter() - t_done) * 1000,
         file_mode,
     )
+    if not suggestions and file_mode:
+        suggestions = list(_FILE_FOLLOW_UPS)
     if suggestions:
         yield sse({"type": "suggestions", "suggestions": suggestions})

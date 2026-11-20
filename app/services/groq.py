@@ -101,7 +101,7 @@ async def complete(
     system: str,
     user_text: str,
     *,
-    max_tokens: int = 400,
+    max_tokens: int = 1024,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> str:
     """One non-streaming Groq call for short helper tasks (follow-up suggestions, memory)."""
