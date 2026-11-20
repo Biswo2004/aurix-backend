@@ -61,6 +61,7 @@ class ConversationDetail(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     use_files: bool = True
+    user_name: str | None = Field(default=None, max_length=80)
 
 
 class FeedbackIn(BaseModel):

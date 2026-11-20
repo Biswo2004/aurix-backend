@@ -34,6 +34,32 @@ SYSTEM_INSTRUCTION = (
     "Reply in well-structured markdown."
 )
 
+_NAME_PART = re.compile(r"[^\W\d_][\w'’.-]*", re.UNICODE)
+
+
+def first_name(raw: str | None) -> str | None:
+    """Return a safe first name for the prompt, or None. Letters, apostrophes, dots and hyphens only."""
+    if not raw:
+        return None
+    match = _NAME_PART.search(raw.strip())
+    if match is None:
+        return None
+    name = match.group(0).strip(".-'’")[:30]
+    return name or None
+
+
+def system_instruction_for(user_name: str | None) -> str:
+    name = first_name(user_name)
+    if name is None:
+        return SYSTEM_INSTRUCTION
+    return (
+        SYSTEM_INSTRUCTION
+        + f' The user\'s first name is "{name}". When you greet the user or start a conversation, '
+        f'address them by first name, for example: "Hello {name}! I am AURIX AI, your helpful and honest '
+        'assistant. How can I help you today?" Do not repeat their name in every reply.'
+    )
+
+
 _SUGGESTION_INSTRUCTION = (
     "Suggest exactly 3 short follow-up questions the user might ask next. "
     "Return only a JSON array of 3 strings, with no markdown."
@@ -160,11 +186,11 @@ async def _await_maybe(value: Any) -> Any:
     return value
 
 
-async def _stream_model_text(contents: list[Any]) -> AsyncIterator[str]:
+async def _stream_model_text(contents: list[Any], user_name: str | None = None) -> AsyncIterator[str]:
     settings = get_settings()
     client = get_genai_client()
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_INSTRUCTION,
+        system_instruction=system_instruction_for(user_name),
         temperature=0.3,
     )
     delay = 1.0
@@ -225,7 +251,7 @@ async def _suggestion_text(question: str, answer: str) -> str:
 
 async def fetch_suggestions(question: str, answer: str) -> list[str]:
     try:
-        raw = await asyncio.wait_for(_suggestion_text(question, answer), timeout=25)
+        raw = await asyncio.wait_for(_suggestion_text(question, answer), timeout=12)
         return extract_json_array(raw)[:3]
     except Exception as exc:
         logger.info("suggestions skipped: %s", exc.__class__.__name__)
@@ -394,6 +420,7 @@ async def iter_chat_sse(
     conversation_id: uuid.UUID,
     message: str,
     use_files: bool,
+    user_name: str | None = None,
 ) -> AsyncIterator[str]:
     """Yield SSE events for one chat turn and persist both messages."""
     from app.db import get_conversation_for_user
@@ -452,7 +479,7 @@ async def iter_chat_sse(
 
     pieces: list[str] = []
     try:
-        async for text in _stream_model_text(contents):
+        async for text in _stream_model_text(contents, user_name):
             pieces.append(text)
             yield sse({"type": "token", "text": text})
     except LLMError as exc:
@@ -492,13 +519,17 @@ async def iter_chat_sse(
         )
         return
 
-    suggestions = await fetch_suggestions(message, answer)
+    # Send "done" right away so the UI unlocks as soon as the answer is complete.
     yield sse(
         {
             "type": "done",
             "message_id": str(assistant.id),
             "sources": sources,
-            "suggestions": suggestions,
+            "suggestions": [],
         }
     )
+    # Start memory extraction before the suggestions call so it survives a client disconnect.
     db.spawn_background(extract_and_store_memories(user_id, message, answer))
+    suggestions = await fetch_suggestions(message, answer)
+    if suggestions:
+        yield sse({"type": "suggestions", "suggestions": suggestions})

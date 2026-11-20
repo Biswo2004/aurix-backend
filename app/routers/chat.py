@@ -47,6 +47,7 @@ async def chat(
                 conversation_id,
                 body.message,
                 body.use_files,
+                body.user_name,
             ):
                 yield event
 
