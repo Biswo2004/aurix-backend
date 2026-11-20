@@ -1,5 +1,6 @@
 """Conversation list, create, read, rename, and delete."""
 
+import re
 import uuid
 from typing import Annotated
 
@@ -23,10 +24,13 @@ from app.schemas import (
 router = APIRouter(tags=["conversations"])
 
 
+_CITATION_MARK = re.compile(r"【[^】]*】|\[\d{1,2}\]")
+
+
 def _preview(text: str | None) -> str | None:
     if text is None:
         return None
-    compact = " ".join(text.split())
+    compact = " ".join(_CITATION_MARK.sub("", text).split())
     if not compact:
         return None
     if len(compact) <= 160:
