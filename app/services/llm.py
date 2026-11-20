@@ -50,20 +50,37 @@ def first_name(raw: str | None) -> str | None:
     return name or None
 
 
-def system_instruction_for(user_name: str | None) -> str:
+def system_instruction_for(user_name: str | None, part_of_day: str | None = None) -> str:
     name = first_name(user_name)
-    if name is None:
+    part = part_of_day if part_of_day in {"morning", "afternoon", "evening", "night"} else None
+    if name is None and part is None:
         return SYSTEM_INSTRUCTION
-    return (
-        SYSTEM_INSTRUCTION
-        + f' The user\'s first name is "{name}". When you greet the user or start a conversation, '
-        f'address them by first name, for example: "Hello {name}! I am AURIX AI, your helpful and honest '
-        'assistant. How can I help you today?" Do not repeat their name in every reply.'
+    text = SYSTEM_INSTRUCTION
+    if name is not None:
+        text += f' The user\'s first name is "{name}".'
+    if part is not None:
+        text += f" It is currently {part} for the user."
+    greeting = "greet them"
+    if name is not None:
+        greeting += " by first name"
+    if part is not None:
+        greeting += f" with a greeting that fits the {part}"
+    text += (
+        " If the user's message is only a greeting or small talk (for example \"hi\" or \"hello\"), "
+        f"reply warmly in 2 to 3 sentences: {greeting}, add one short uplifting quote that fits the moment "
+        "(name its author only if you are certain of it, otherwise write a short original line), "
+        "and invite them to ask something. Vary your wording every time, never reuse the same opening, "
+        "and mention that you are AURIX AI at most once per conversation. "
+        "For every other message, answer directly with no greeting and no quote, "
+        "and do not repeat their name in every reply."
     )
+    return text
 
 
 _SUGGESTION_INSTRUCTION = (
-    "Suggest exactly 3 short follow-up questions the user might ask next. "
+    "Suggest exactly 3 follow-up questions the user might ask next, based on the answer. "
+    "Write each from the user's point of view, specific to the topic, under 60 characters, "
+    "and different from each other (for example: go deeper, a practical example, a related next step). "
     "Return only a JSON array of 3 strings, with no markdown."
 )
 
@@ -245,10 +262,12 @@ def _has_images(contents: list[Any]) -> bool:
     return False
 
 
-async def _stream_model_text(contents: list[Any], user_name: str | None = None) -> AsyncIterator[str]:
+async def _stream_model_text(
+    contents: list[Any], user_name: str | None = None, part_of_day: str | None = None
+) -> AsyncIterator[str]:
     settings = get_settings()
     client = get_genai_client()
-    instruction = system_instruction_for(user_name)
+    instruction = system_instruction_for(user_name, part_of_day)
     delay = 0.5
     emitted = False
     attempt = 0
@@ -306,15 +325,22 @@ async def _suggestion_text(question: str, answer: str) -> str:
 
 
 async def helper_generate(client: Any, contents: str, instruction: str, temperature: float) -> str:
-    """Short helper call: try the helper model once, then the primary model once. No long retry chain."""
+    """Short helper call: light model, then Groq (if configured), then the other models once each. No retry chain."""
+    settings = get_settings()
     models = [get_helper_model()]
-    for extra in [settings_primary(), *get_settings().fallback_models]:
+    candidates = [settings.primary_model, *settings.fallback_models]
+    groq_models = [m for m in candidates if groq_service.is_groq_model(m)]
+    if settings.GROQ_API_KEY and groq_models and groq_models[0] not in models:
+        models.append(groq_models[0])  # fast second choice, so follow-up chips appear even if Google is slow
+    for extra in candidates:
         if extra not in models and not groq_service.is_groq_model(extra) and len(models) < 3:
             models.append(extra)
     last: Exception | None = None
     for model in models:
         for _ in range(2):  # second pass only if the thinking setting was rejected
             try:
+                if groq_service.is_groq_model(model):
+                    return await groq_service.complete(model, instruction, contents)
                 result = await _await_maybe(
                     client.aio.models.generate_content(
                         model=model,
@@ -342,7 +368,7 @@ def settings_primary() -> str:
 
 async def fetch_suggestions(question: str, answer: str) -> list[str]:
     try:
-        raw = await asyncio.wait_for(_suggestion_text(question, answer), timeout=12)
+        raw = await asyncio.wait_for(_suggestion_text(question, answer), timeout=15)
         return extract_json_array(raw)[:3]
     except Exception as exc:
         logger.info("suggestions skipped: %s", exc.__class__.__name__)
@@ -512,6 +538,7 @@ async def iter_chat_sse(
     message: str,
     use_files: bool,
     user_name: str | None = None,
+    part_of_day: str | None = None,
 ) -> AsyncIterator[str]:
     """Yield SSE events for one chat turn and persist both messages."""
     from app.db import get_conversation_for_user
@@ -574,7 +601,7 @@ async def iter_chat_sse(
     t_prep = time.perf_counter()
     t_first: float | None = None
     try:
-        async for text in _stream_model_text(contents, user_name):
+        async for text in _stream_model_text(contents, user_name, part_of_day):
             if t_first is None:
                 t_first = time.perf_counter()
             pieces.append(text)

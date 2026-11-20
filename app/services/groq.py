@@ -84,3 +84,31 @@ async def stream_groq(
                 text = delta.get("content")
                 if text:
                     yield text
+
+
+async def complete(
+    model: str,
+    system: str,
+    user_text: str,
+    *,
+    max_tokens: int = 400,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> str:
+    """One non-streaming Groq call for short helper tasks (follow-up suggestions, memory)."""
+    api_key = get_settings().GROQ_API_KEY
+    if not api_key:
+        raise GroqError(None, "GROQ_API_KEY is not set")
+    body: dict[str, Any] = {
+        "model": model.removeprefix(GROQ_PREFIX),
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_text}],
+        "reasoning_effort": "low",
+        "include_reasoning": False,
+        "max_completion_tokens": max_tokens,
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0), transport=transport) as client:
+        response = await client.post(GROQ_URL, headers=headers, json=body)
+    if response.status_code != 200:
+        raise GroqError(response.status_code, response.text[:200])
+    choices = response.json().get("choices") or []
+    return ((choices[0].get("message") or {}).get("content") or "") if choices else ""
