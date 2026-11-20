@@ -70,20 +70,30 @@ async def stream_groq(
             if response.status_code != 200:
                 detail = (await response.aread()).decode("utf-8", "replace")[:200]
                 raise GroqError(response.status_code, detail)
+            finish: str | None = None
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
-                    return
+                    break
                 try:
-                    choices = json.loads(data).get("choices") or []
+                    payload = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                delta = (choices[0].get("delta") or {}) if choices else {}
-                text = delta.get("content")
+                if payload.get("error"):  # Groq can send an error event in the middle of a stream
+                    raise GroqError(None, f"stream error: {str(payload['error'])[:200]}")
+                choices = payload.get("choices") or []
+                if not choices:
+                    continue
+                finish = choices[0].get("finish_reason") or finish
+                text = (choices[0].get("delta") or {}).get("content")
                 if text:
                     yield text
+            if finish != "stop":
+                # "length" or no finish reason at all means the answer was cut off, not completed.
+                logger.warning("groq stream incomplete model=%s finish_reason=%s", model, finish)
+                raise GroqError(None, f"incomplete stream (finish_reason={finish})")
 
 
 async def complete(
