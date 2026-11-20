@@ -402,10 +402,42 @@ async def test_stream_fails_over_to_fallback_model(monkeypatch: pytest.MonkeyPat
 
     fake = type("Client", (), {"aio": type("Aio", (), {"models": Models()})()})()
     settings = get_settings()
-    monkeypatch.setattr(settings, "GEMMA_MODEL", "primary-m")
+    monkeypatch.setattr(settings, "PRIMARY_MODEL", "primary-m")
     monkeypatch.setattr(settings, "FALLBACK_MODEL", "fallback-m")
     monkeypatch.setattr(llm, "get_genai_client", lambda: fake)
     out = "".join([piece async for piece in llm._stream_model_text([], None)])
     assert out == "ok from fallback"
     assert used == ["primary-m", "fallback-m"]
     assert llm.get_helper_model() == "fallback-m"
+
+
+def test_thinking_level_per_model_family(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "GEMMA_THINKING", "minimal")
+    monkeypatch.setattr(settings, "GEMINI_THINKING", "low")
+    monkeypatch.setattr(llm, "_thinking_rejected", set())
+
+    def level(model: str) -> str:
+        cfg = llm.thinking_config_for(model)
+        return str(getattr(cfg.thinking_level, "value", cfg.thinking_level)).lower()
+
+    assert level("gemma-4-26b-a4b-it") == "minimal"
+    assert level("gemini-3.8-flash") == "low"
+    monkeypatch.setattr(settings, "GEMINI_THINKING", "")
+    assert llm.thinking_config_for("gemini-3.8-flash") is None
+
+
+def test_rejected_thinking_setting_is_dropped(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "GEMINI_THINKING", "low")
+    monkeypatch.setattr(llm, "_thinking_rejected", set())
+    err = Exception("400 INVALID_ARGUMENT: Thinking level MINIMAL is not supported for this model")
+    assert llm.thinking_was_rejected(err, "gemini-x") is True
+    assert llm.thinking_config_for("gemini-x") is None
+    assert llm.thinking_was_rejected(Exception("503 UNAVAILABLE"), "gemini-y") is False
+
+
+def test_temperature_only_sent_to_gemma(monkeypatch):
+    monkeypatch.setattr(llm, "_thinking_rejected", set())
+    assert llm.build_config("gemini-3.8-flash", temperature=0.3).temperature is None
+    assert llm.build_config("gemma-4-26b-a4b-it", temperature=0.3).temperature == 0.3

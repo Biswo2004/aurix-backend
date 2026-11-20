@@ -2,11 +2,9 @@
 
 import logging
 
-from google.genai import types
 from sqlalchemy import delete, select
 
 from app import db
-from app.config import get_settings
 from app.models import Memory
 from app.services import llm as llm_service
 
@@ -25,32 +23,13 @@ _MEMORY_INSTRUCTION = (
 
 
 async def _generate_fact_text(user_message: str, assistant_message: str) -> str:
-    settings = get_settings()
     client = llm_service.get_genai_client()
     contents = (
         "Conversation excerpt:\n"
         f"User: {user_message[:4000]}\n"
         f"Assistant: {assistant_message[:4000]}"
     )
-    config = types.GenerateContentConfig(
-        system_instruction=_MEMORY_INSTRUCTION,
-        temperature=0.2,
-    )
-
-    async def _call() -> str:
-        result = client.aio.models.generate_content(
-            model=llm_service.get_helper_model(),
-            contents=contents,
-            config=config,
-        )
-        if hasattr(result, "__await__"):
-            result = await result
-        text = getattr(result, "text", None) or ""
-        if text:
-            return text
-        return llm_service.extract_answer_text(result)
-
-    return await llm_service.with_gemini_retries(_call)
+    return await llm_service.helper_generate(client, contents, _MEMORY_INSTRUCTION, 0.2)
 
 
 async def extract_and_store_memories(user_id: str, user_message: str, assistant_message: str) -> None:

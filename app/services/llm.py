@@ -83,9 +83,52 @@ def sse(payload: dict[str, Any]) -> str:
 
 
 def get_helper_model() -> str:
-    """Model for short helper calls (suggestions, memory): the fallback model if set, else the primary."""
+    """Model for short helper calls (suggestions, memory): the light model."""
+    return get_settings().light_model
+
+
+# Models that rejected a thinking setting with a 400; we stop sending it to them for this process.
+_thinking_rejected: set[str] = set()
+
+
+def thinking_config_for(model: str) -> Any:
+    """Thinking setting per model family, or None to send nothing.
+
+    Gemma 4: "minimal" turns thinking off. Gemini 3.x: "low" gives the fastest first word
+    ("minimal" is rejected by gemini-3.8-flash).
+    """
+    if model in _thinking_rejected:
+        return None
     settings = get_settings()
-    return settings.FALLBACK_MODEL or settings.GEMMA_MODEL
+    level = settings.GEMMA_THINKING if model.lower().startswith("gemma") else settings.GEMINI_THINKING
+    if not level:
+        return None
+    try:
+        return types.ThinkingConfig(thinking_level=level)
+    except Exception:  # older google-genai without thinking_level
+        return None
+
+
+def thinking_was_rejected(exc: Exception, model: str) -> bool:
+    """True if a 400 error was caused by the thinking setting; remembers the model so we stop sending it."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    if str(status) != "400" and "400" not in str(exc):
+        return False
+    if "thinking" not in str(exc).lower():
+        return False
+    _thinking_rejected.add(model)
+    logger.warning("thinking setting rejected model=%s; retrying without it", model)
+    return True
+
+
+def build_config(model: str, **kwargs: Any) -> Any:
+    # Gemini 3.x ignores or discourages temperature; only Gemma gets it.
+    if not model.lower().startswith("gemma"):
+        kwargs.pop("temperature", None)
+    thinking = thinking_config_for(model)
+    if thinking is not None:
+        kwargs["thinking_config"] = thinking
+    return types.GenerateContentConfig(**kwargs)
 
 
 def get_genai_client() -> genai.Client:
@@ -196,21 +239,20 @@ async def _await_maybe(value: Any) -> Any:
 async def _stream_model_text(contents: list[Any], user_name: str | None = None) -> AsyncIterator[str]:
     settings = get_settings()
     client = get_genai_client()
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction_for(user_name),
-        temperature=0.3,
-    )
+    instruction = system_instruction_for(user_name)
     delay = 0.5
     emitted = False
-    for attempt in range(4):
-        # First try the primary model; after a 429/5xx switch to the fallback model (if configured).
-        model = settings.GEMMA_MODEL if attempt == 0 or not settings.FALLBACK_MODEL else settings.FALLBACK_MODEL
+    attempt = 0
+    while True:
+        # Primary first; after a 429/5xx switch to the fallback model (if configured).
+        use_fallback = attempt > 0 and bool(settings.FALLBACK_MODEL)
+        model = settings.FALLBACK_MODEL if use_fallback else settings.primary_model
         try:
             stream = await _await_maybe(
                 client.aio.models.generate_content_stream(
                     model=model,
                     contents=contents,
-                    config=config,
+                    config=build_config(model, system_instruction=instruction, temperature=0.3),
                 )
             )
             async for chunk in stream:
@@ -221,41 +263,59 @@ async def _stream_model_text(contents: list[Any], user_name: str | None = None) 
                 yield text
             return
         except Exception as exc:
+            if not emitted and thinking_was_rejected(exc, model):
+                continue  # same model, no thinking setting; does not use up a retry
             if emitted or not is_retryable(exc) or attempt >= 3:
                 logger.warning("gemini stream failed model=%s status=%s", model, _status_of(exc))
                 raise LLMError("AURIX AI is busy right now. Please try again in a moment.") from exc
-            logger.warning("gemini stream retry attempt=%s model=%s status=%s", attempt + 1, model, _status_of(exc))
+            attempt += 1
+            logger.warning("gemini stream retry attempt=%s model=%s status=%s", attempt, model, _status_of(exc))
             await asyncio.sleep(delay)
             delay *= 2
 
 
 async def _suggestion_text(question: str, answer: str) -> str:
-    settings = get_settings()
     client = get_genai_client()
     contents = (
         "Write follow-up questions as a JSON array.\n"
         f"Question: {question[:2000]}\n"
         f"Answer: {answer[:4000]}"
     )
-    config = types.GenerateContentConfig(
-        system_instruction=_SUGGESTION_INSTRUCTION,
-        temperature=0.3,
-    )
+    return await helper_generate(client, contents, _SUGGESTION_INSTRUCTION, 0.3)
 
-    async def _call() -> str:
-        result = await _await_maybe(
-            client.aio.models.generate_content(
-                model=get_helper_model(),
-                contents=contents,
-                config=config,
-            )
-        )
-        text = getattr(result, "text", None)
-        if text:
-            return text
-        return extract_answer_text(result)
 
-    return await with_gemini_retries(_call)
+async def helper_generate(client: Any, contents: str, instruction: str, temperature: float) -> str:
+    """Short helper call: try the helper model once, then the primary model once. No long retry chain."""
+    models = [get_helper_model()]
+    if settings_primary() not in models:
+        models.append(settings_primary())
+    last: Exception | None = None
+    for model in models:
+        for _ in range(2):  # second pass only if the thinking setting was rejected
+            try:
+                result = await _await_maybe(
+                    client.aio.models.generate_content(
+                        model=model,
+                        contents=contents,
+                        config=build_config(model, system_instruction=instruction, temperature=temperature),
+                    )
+                )
+                text = getattr(result, "text", None)
+                return text or extract_answer_text(result)
+            except Exception as exc:
+                last = exc
+                if thinking_was_rejected(exc, model):
+                    continue
+                if not is_retryable(exc):
+                    raise
+                logger.warning("helper call failed model=%s status=%s", model, _status_of(exc))
+                break
+    assert last is not None
+    raise last
+
+
+def settings_primary() -> str:
+    return get_settings().primary_model
 
 
 async def fetch_suggestions(question: str, answer: str) -> list[str]:

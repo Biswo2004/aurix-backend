@@ -3,7 +3,7 @@
 from functools import lru_cache
 from urllib.parse import quote
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine.url import make_url
 
@@ -75,20 +75,42 @@ class Settings(BaseSettings):
     SUPABASE_URL: str = Field(min_length=1)
     DATABASE_URL: str = Field(min_length=1)
     GOOGLE_API_KEY: str = Field(min_length=1)
-    GEMMA_MODEL: str = Field(min_length=1)
+    # Model roles. PRIMARY_MODEL answers chats; FALLBACK_MODEL takes over on 429/5xx;
+    # LIGHT_MODEL does short helper calls (suggestions, memory). GEMMA_MODEL / HELPER_MODEL are the old names.
+    PRIMARY_MODEL: str = ""
+    GEMMA_MODEL: str = ""
     ALLOWED_ORIGINS: str = Field(min_length=1)
-    # Optional second model used when the primary model returns 503/429, and for helper calls.
     FALLBACK_MODEL: str = ""
+    LIGHT_MODEL: str = ""
+    HELPER_MODEL: str = ""
+    # Thinking level per model family. Empty string = do not send a thinking setting.
+    # Gemma 4: "minimal" (off) or "high". Gemini 3.x: "low", "medium" or "high" ("minimal" is rejected by 3.8 Flash).
+    GEMMA_THINKING: str = "minimal"
+    GEMINI_THINKING: str = "low"
 
     @field_validator("SUPABASE_URL")
     @classmethod
     def _strip_url(cls, value: str) -> str:
         return value.strip().rstrip("/")
 
-    @field_validator("DATABASE_URL", "GOOGLE_API_KEY", "GEMMA_MODEL", "ALLOWED_ORIGINS", "FALLBACK_MODEL")
+    @field_validator("DATABASE_URL", "GOOGLE_API_KEY", "PRIMARY_MODEL", "GEMMA_MODEL", "ALLOWED_ORIGINS", "FALLBACK_MODEL", "LIGHT_MODEL", "HELPER_MODEL", "GEMMA_THINKING", "GEMINI_THINKING")
     @classmethod
     def _strip_value(cls, value: str) -> str:
         return value.strip()
+
+    @model_validator(mode="after")
+    def _need_primary(self) -> "Settings":
+        if not (self.PRIMARY_MODEL or self.GEMMA_MODEL):
+            raise ValueError("Set PRIMARY_MODEL (or the older GEMMA_MODEL)")
+        return self
+
+    @property
+    def primary_model(self) -> str:
+        return self.PRIMARY_MODEL or self.GEMMA_MODEL
+
+    @property
+    def light_model(self) -> str:
+        return self.LIGHT_MODEL or self.HELPER_MODEL or self.FALLBACK_MODEL or self.primary_model
 
     @property
     def async_database_url(self) -> str:
