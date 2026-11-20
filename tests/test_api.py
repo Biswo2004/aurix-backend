@@ -742,3 +742,50 @@ async def test_helper_tries_groq_first_when_it_is_the_primary(monkeypatch):
     monkeypatch.setattr(llm.groq_service, "complete", fake_complete)
     assert await llm.fetch_suggestions("q", "a") == ["a?", "b?", "c?"]
     assert order == ["groq:openai/gpt-oss-120b"]
+
+
+def test_odd_citation_markers_become_plain_numbers():
+    assert llm.normalize_citations("Fact 【4†L1-L5】 and 【2】 and [1].") == "Fact [4] and [2] and [1]."
+    assert llm.normalize_citations("no markers") == "no markers"
+
+
+def test_system_instruction_forbids_other_citation_formats():
+    assert "【" in llm.SYSTEM_INSTRUCTION and "never use" in llm.SYSTEM_INSTRUCTION
+
+
+@pytest.mark.asyncio
+async def test_gpt_oss_style_citations_still_give_page_sources_and_suggestions(
+    client: AsyncClient,
+    database: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_stream(contents, user_name=None, part_of_day=None):
+        for piece in ("Revenue was 42 million ", "【1†L1-L5】", " in the report."):
+            yield piece
+
+    async def fake_suggestions(question, answer):
+        return ["Why did it change?", "Show the table", "Compare with last year"]
+
+    monkeypatch.setattr(llm, "_stream_model_text", fake_stream)
+    monkeypatch.setattr(llm, "fetch_suggestions", fake_suggestions)
+
+    created = await client.post("/api/conversations")
+    cid = created.json()["id"]
+    notes = b"Quarterly revenue was 42 million dollars in the uploaded report. " * 5
+    await client.post(f"/api/conversations/{cid}/files", files=[("files", ("report.txt", notes, "text/plain"))])
+    chat = await client.post(f"/api/conversations/{cid}/chat", json={"message": "What was revenue?", "use_files": True})
+    events = await _sse_events(chat)
+
+    kinds = [e["type"] for e in events]
+    assert kinds[-2:] == ["done", "suggestions"]
+    done = events[-2]
+    assert [s["index"] for s in done["sources"]] == [1]
+    assert done["sources"][0]["file_name"] == "report.txt"
+    assert events[-1]["suggestions"] == ["Why did it change?", "Show the table", "Compare with last year"]
+
+    await _drain_background()
+    detail = (await client.get(f"/api/conversations/{cid}")).json()
+    saved = next(m for m in detail["messages"] if m["role"] == "assistant")
+    assert "【" not in saved["content"] and "[1]" in saved["content"]
+    listing = (await client.get("/api/conversations")).json()
+    assert "【" not in (listing[0]["last_message_preview"] or "") and "[1]" not in (listing[0]["last_message_preview"] or "")
