@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import db
 from app.config import get_settings
 from app.models import Conversation, File, Memory, Message
+from app.services import groq as groq_service
 from app.services.retriever import load_conversation_chunks, load_tabular_summaries, rank_chunks
 from app.services.safety import check_message
 
@@ -236,6 +237,14 @@ async def _await_maybe(value: Any) -> Any:
     return value
 
 
+def _has_images(contents: list[Any]) -> bool:
+    for item in contents:
+        for part in getattr(item, "parts", None) or []:
+            if getattr(part, "inline_data", None) is not None:
+                return True
+    return False
+
+
 async def _stream_model_text(contents: list[Any], user_name: str | None = None) -> AsyncIterator[str]:
     settings = get_settings()
     client = get_genai_client()
@@ -243,11 +252,22 @@ async def _stream_model_text(contents: list[Any], user_name: str | None = None) 
     delay = 0.5
     emitted = False
     attempt = 0
+    # Primary first; after each 429/5xx move to the next fallback model; the last model gets one extra try.
+    chain = [settings.primary_model, *[m for m in settings.fallback_models if m != settings.primary_model]]
+    # Groq is text-only and needs its key: leave it out when images are attached or the key is missing.
+    if not settings.GROQ_API_KEY or _has_images(contents):
+        chain = [m for m in chain if not groq_service.is_groq_model(m)]
+    if not chain:
+        raise LLMError("No usable model is configured. Check PRIMARY_MODEL, FALLBACK_MODEL and GROQ_API_KEY.")
+    max_attempts = len(chain) + 1
     while True:
-        # Primary first; after a 429/5xx switch to the fallback model (if configured).
-        use_fallback = attempt > 0 and bool(settings.FALLBACK_MODEL)
-        model = settings.FALLBACK_MODEL if use_fallback else settings.primary_model
+        model = chain[min(attempt, len(chain) - 1)]
         try:
+            if groq_service.is_groq_model(model):
+                async for text in groq_service.stream_groq(model, instruction, contents):
+                    emitted = True
+                    yield text
+                return
             stream = await _await_maybe(
                 client.aio.models.generate_content_stream(
                     model=model,
@@ -265,13 +285,14 @@ async def _stream_model_text(contents: list[Any], user_name: str | None = None) 
         except Exception as exc:
             if not emitted and thinking_was_rejected(exc, model):
                 continue  # same model, no thinking setting; does not use up a retry
-            if emitted or not is_retryable(exc) or attempt >= 3:
+            if emitted or not is_retryable(exc) or attempt >= max_attempts - 1:
                 logger.warning("gemini stream failed model=%s status=%s", model, _status_of(exc))
                 raise LLMError("AURIX AI is busy right now. Please try again in a moment.") from exc
             attempt += 1
             logger.warning("gemini stream retry attempt=%s model=%s status=%s", attempt, model, _status_of(exc))
-            await asyncio.sleep(delay)
-            delay *= 2
+            if chain[min(attempt, len(chain) - 1)] == model:
+                await asyncio.sleep(delay)  # same model again: back off. A different model: switch at once.
+                delay *= 2
 
 
 async def _suggestion_text(question: str, answer: str) -> str:
@@ -287,8 +308,9 @@ async def _suggestion_text(question: str, answer: str) -> str:
 async def helper_generate(client: Any, contents: str, instruction: str, temperature: float) -> str:
     """Short helper call: try the helper model once, then the primary model once. No long retry chain."""
     models = [get_helper_model()]
-    if settings_primary() not in models:
-        models.append(settings_primary())
+    for extra in [settings_primary(), *get_settings().fallback_models]:
+        if extra not in models and not groq_service.is_groq_model(extra) and len(models) < 3:
+            models.append(extra)
     last: Exception | None = None
     for model in models:
         for _ in range(2):  # second pass only if the thinking setting was rejected

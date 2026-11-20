@@ -441,3 +441,206 @@ def test_temperature_only_sent_to_gemma(monkeypatch):
     monkeypatch.setattr(llm, "_thinking_rejected", set())
     assert llm.build_config("gemini-3.8-flash", temperature=0.3).temperature is None
     assert llm.build_config("gemma-4-26b-a4b-it", temperature=0.3).temperature == 0.3
+
+
+@pytest.mark.asyncio
+async def test_fallback_list_is_tried_in_order(monkeypatch):
+    used: list[str] = []
+
+    class Overloaded(Exception):
+        pass
+
+    class Chunk:
+        def __init__(self, text):
+            part = type("P", (), {"text": text, "thought": False})()
+            self.candidates = [type("C", (), {"content": type("K", (), {"parts": [part]})()})()]
+
+    class Models:
+        def generate_content_stream(self, model, contents, config):
+            used.append(model)
+            if model != "third-m":
+                raise Overloaded("503 UNAVAILABLE")
+
+            async def gen():
+                yield Chunk("ok from third")
+
+            return gen()
+
+    fake = type("Client", (), {"aio": type("Aio", (), {"models": Models()})()})()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "PRIMARY_MODEL", "primary-m")
+    monkeypatch.setattr(settings, "FALLBACK_MODEL", "second-m, third-m")
+    monkeypatch.setattr(llm, "get_genai_client", lambda: fake)
+    monkeypatch.setattr(llm.asyncio, "sleep", lambda *_: _noop())
+    out = "".join([piece async for piece in llm._stream_model_text([], None)])
+    assert out == "ok from third"
+    assert used == ["primary-m", "second-m", "third-m"]
+
+
+async def _noop():
+    return None
+
+
+def test_groq_messages_skip_images_and_map_roles():
+    from app.services import groq
+
+    def content(role, *texts):
+        parts = [type("P", (), {"text": t})() for t in texts]
+        return type("C", (), {"role": role, "parts": parts})()
+
+    image = type("C", (), {"role": "user", "parts": [type("P", (), {"text": None})()]})()
+    msgs = groq.contents_to_messages("sys", [content("user", "hi"), content("model", "hello"), image])
+    assert msgs == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_groq_stream_parses_sse(monkeypatch):
+    import httpx
+    from app.services import groq
+
+    monkeypatch.setattr(get_settings(), "GROQ_API_KEY", "k")
+    body = (
+        'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
+        'data: {"choices":[{"delta":{"reasoning":"thinking","content":null}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["auth"] = request.headers["authorization"]
+        seen["body"] = request.content.decode()
+        return httpx.Response(200, content=body.encode())
+
+    out = [t async for t in groq.stream_groq("groq:openai/gpt-oss-120b", "sys", [], transport=httpx.MockTransport(handler))]
+    assert "".join(out) == "Hello"
+    assert seen["auth"] == "Bearer k"
+    assert '"model":"openai/gpt-oss-120b"' in seen["body"].replace(" ", "")
+
+
+@pytest.mark.asyncio
+async def test_groq_error_status_is_retryable():
+    import httpx
+    from app.services import groq
+
+    get_settings().GROQ_API_KEY = "k"
+    transport = httpx.MockTransport(lambda r: httpx.Response(429, content=b"rate limited"))
+    with pytest.raises(groq.GroqError) as info:
+        async for _ in groq.stream_groq("groq:m", "s", [], transport=transport):
+            pass
+    assert llm.is_retryable(info.value)
+
+
+@pytest.mark.asyncio
+async def test_chain_ends_on_groq_after_google_models_fail(monkeypatch):
+    used: list[str] = []
+
+    class Overloaded(Exception):
+        pass
+
+    class Models:
+        def generate_content_stream(self, model, contents, config):
+            used.append(model)
+            raise Overloaded("503 UNAVAILABLE")
+
+    async def fake_groq(model, system, contents):
+        used.append(model)
+        yield "ok from groq"
+
+    fake = type("Client", (), {"aio": type("Aio", (), {"models": Models()})()})()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "PRIMARY_MODEL", "primary-m")
+    monkeypatch.setattr(settings, "FALLBACK_MODEL", "second-m,groq:openai/gpt-oss-120b")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "k")
+    monkeypatch.setattr(llm, "get_genai_client", lambda: fake)
+    monkeypatch.setattr(llm.groq_service, "stream_groq", fake_groq)
+    monkeypatch.setattr(llm.asyncio, "sleep", lambda *_: _noop())
+    out = "".join([p async for p in llm._stream_model_text([], None)])
+    assert out == "ok from groq"
+    assert used == ["primary-m", "second-m", "groq:openai/gpt-oss-120b"]
+    # helper calls never use Groq
+    assert not llm.get_helper_model().startswith("groq:")
+
+
+@pytest.mark.asyncio
+async def test_groq_primary_then_google_fallbacks(monkeypatch):
+    used: list[str] = []
+
+    async def failing_groq(model, system, contents):
+        used.append(model)
+        raise llm.groq_service.GroqError(429, "rate limited")
+        yield  # pragma: no cover
+
+    class Chunk:
+        def __init__(self, text):
+            part = type("P", (), {"text": text, "thought": False})()
+            self.candidates = [type("C", (), {"content": type("K", (), {"parts": [part]})()})()]
+
+    class Models:
+        def generate_content_stream(self, model, contents, config):
+            used.append(model)
+
+            async def gen():
+                yield Chunk("ok from google")
+
+            return gen()
+
+    fake = type("Client", (), {"aio": type("Aio", (), {"models": Models()})()})()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "PRIMARY_MODEL", "groq:openai/gpt-oss-120b")
+    monkeypatch.setattr(settings, "FALLBACK_MODEL", "flash-lite,gemma-x")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "k")
+    monkeypatch.setattr(llm, "get_genai_client", lambda: fake)
+    monkeypatch.setattr(llm.groq_service, "stream_groq", failing_groq)
+    monkeypatch.setattr(llm.asyncio, "sleep", lambda *_: _noop())
+    out = "".join([p async for p in llm._stream_model_text([], None)])
+    assert out == "ok from google"
+    assert used == ["groq:openai/gpt-oss-120b", "flash-lite"]
+
+
+@pytest.mark.asyncio
+async def test_groq_skipped_when_images_attached(monkeypatch):
+    used: list[str] = []
+
+    class Chunk:
+        def __init__(self, text):
+            part = type("P", (), {"text": text, "thought": False})()
+            self.candidates = [type("C", (), {"content": type("K", (), {"parts": [part]})()})()]
+
+    class Models:
+        def generate_content_stream(self, model, contents, config):
+            used.append(model)
+
+            async def gen():
+                yield Chunk("saw the image")
+
+            return gen()
+
+    fake = type("Client", (), {"aio": type("Aio", (), {"models": Models()})()})()
+    settings = get_settings()
+    monkeypatch.setattr(settings, "PRIMARY_MODEL", "groq:openai/gpt-oss-120b")
+    monkeypatch.setattr(settings, "FALLBACK_MODEL", "flash-lite")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "k")
+    monkeypatch.setattr(llm, "get_genai_client", lambda: fake)
+    image_part = type("P", (), {"text": None, "inline_data": object()})()
+    contents = [type("C", (), {"role": "user", "parts": [image_part]})()]
+    out = "".join([p async for p in llm._stream_model_text(contents, None)])
+    assert out == "saw the image"
+    assert used == ["flash-lite"]
+
+
+@pytest.mark.asyncio
+async def test_no_usable_model_raises_clear_error(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "PRIMARY_MODEL", "groq:openai/gpt-oss-120b")
+    monkeypatch.setattr(settings, "FALLBACK_MODEL", "")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "")
+    monkeypatch.setattr(llm, "get_genai_client", lambda: object())
+    with pytest.raises(llm.LLMError):
+        async for _ in llm._stream_model_text([], None):
+            pass

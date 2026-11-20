@@ -84,16 +84,17 @@ class Settings(BaseSettings):
     LIGHT_MODEL: str = ""
     HELPER_MODEL: str = ""
     # Thinking level per model family. Empty string = do not send a thinking setting.
-    # Gemma 4: "minimal" (off) or "high". Gemini 3.x: "low", "medium" or "high" ("minimal" is rejected by 3.8 Flash).
+    # Gemma 4: "minimal" (off) or "high". Gemini 3.x: "low", "medium" or "high" ("minimal" is rejected by 3.8 Flash); empty = model default (fastest on Flash-Lite).
+    GROQ_API_KEY: str = ""  # optional; enables fallback ids like "groq:openai/gpt-oss-120b"
     GEMMA_THINKING: str = "minimal"
-    GEMINI_THINKING: str = "low"
+    GEMINI_THINKING: str = ""
 
     @field_validator("SUPABASE_URL")
     @classmethod
     def _strip_url(cls, value: str) -> str:
         return value.strip().rstrip("/")
 
-    @field_validator("DATABASE_URL", "GOOGLE_API_KEY", "PRIMARY_MODEL", "GEMMA_MODEL", "ALLOWED_ORIGINS", "FALLBACK_MODEL", "LIGHT_MODEL", "HELPER_MODEL", "GEMMA_THINKING", "GEMINI_THINKING")
+    @field_validator("DATABASE_URL", "GOOGLE_API_KEY", "PRIMARY_MODEL", "GEMMA_MODEL", "ALLOWED_ORIGINS", "FALLBACK_MODEL", "LIGHT_MODEL", "HELPER_MODEL", "GEMMA_THINKING", "GEMINI_THINKING", "GROQ_API_KEY")
     @classmethod
     def _strip_value(cls, value: str) -> str:
         return value.strip()
@@ -109,8 +110,14 @@ class Settings(BaseSettings):
         return self.PRIMARY_MODEL or self.GEMMA_MODEL
 
     @property
+    def fallback_models(self) -> list[str]:
+        """FALLBACK_MODEL may hold several ids separated by commas, tried in order."""
+        return [m.strip() for m in self.FALLBACK_MODEL.split(",") if m.strip()]
+
+    @property
     def light_model(self) -> str:
-        return self.LIGHT_MODEL or self.HELPER_MODEL or self.FALLBACK_MODEL or self.primary_model
+        google_fallbacks = [m for m in self.fallback_models if not m.startswith("groq:")]
+        return self.LIGHT_MODEL or self.HELPER_MODEL or (google_fallbacks[0] if google_fallbacks else "") or self.primary_model
 
     @property
     def async_database_url(self) -> str:
