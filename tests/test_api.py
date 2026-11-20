@@ -516,6 +516,7 @@ async def test_groq_stream_parses_sse(monkeypatch):
         'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
         'data: {"choices":[{"delta":{"reasoning":"thinking","content":null}}]}\n\n'
         'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
         "data: [DONE]\n\n"
     )
     seen = {}
@@ -686,3 +687,27 @@ async def test_helper_falls_back_to_groq_when_google_is_down(monkeypatch):
     monkeypatch.setattr(llm, "get_genai_client", lambda: fake)
     monkeypatch.setattr(llm.groq_service, "complete", fake_complete)
     assert await llm.fetch_suggestions("q", "a") == ["a?", "b?", "c?"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tail",
+    [
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n',  # hit a token limit
+        "",  # connection ended with no finish reason
+        'data: {"error":{"message":"rate limit"}}\n\n',  # error event mid-stream
+    ],
+)
+async def test_groq_cut_off_stream_is_an_error_not_a_short_answer(monkeypatch, tail):
+    import httpx
+
+    from app.services import groq
+
+    monkeypatch.setattr(get_settings(), "GROQ_API_KEY", "k")
+    body = 'data: {"choices":[{"delta":{"content":"ready for your"}}]}\n\n' + tail
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body.encode())
+
+    with pytest.raises(groq.GroqError):
+        [t async for t in groq.stream_groq("groq:m", "sys", [], transport=httpx.MockTransport(handler))]
