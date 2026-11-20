@@ -711,3 +711,34 @@ async def test_groq_cut_off_stream_is_an_error_not_a_short_answer(monkeypatch, t
 
     with pytest.raises(groq.GroqError):
         [t async for t in groq.stream_groq("groq:m", "sys", [], transport=httpx.MockTransport(handler))]
+
+
+def test_cited_sources_keeps_only_cited_excerpts():
+    sources = [{"index": i, "page": i} for i in range(1, 6)]
+    assert [s["index"] for s in llm._cited_sources("Yes [2]. Also [4][2].", sources)] == [2, 4]
+    # No citations at all: keep the three best matches instead of nothing or all five.
+    assert [s["index"] for s in llm._cited_sources("No numbers here.", sources)] == [1, 2, 3]
+    assert llm._cited_sources("anything [1]", []) == []
+
+
+def test_system_instruction_asks_for_numbered_citations_with_pages():
+    text = llm.SYSTEM_INSTRUCTION
+    assert "square brackets" in text and "page" in text
+
+
+@pytest.mark.asyncio
+async def test_helper_tries_groq_first_when_it_is_the_primary(monkeypatch):
+    order: list[str] = []
+
+    async def fake_complete(model, system, user_text, **kw):
+        order.append(model)
+        return '["a?", "b?", "c?"]'
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "PRIMARY_MODEL", "groq:openai/gpt-oss-120b")
+    monkeypatch.setattr(settings, "FALLBACK_MODEL", "flash-lite")
+    monkeypatch.setattr(settings, "LIGHT_MODEL", "flash-lite")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "k")
+    monkeypatch.setattr(llm.groq_service, "complete", fake_complete)
+    assert await llm.fetch_suggestions("q", "a") == ["a?", "b?", "c?"]
+    assert order == ["groq:openai/gpt-oss-120b"]
