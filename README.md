@@ -25,7 +25,10 @@ Copy `.env.example` to `.env` and fill in the values. Do not commit `.env`.
 | `SUPABASE_URL` | Project URL used to fetch the Auth JWKS |
 | `DATABASE_URL` | `postgresql+asyncpg://...` session pooler URL |
 | `GOOGLE_API_KEY` | Google Gen AI API key |
-| `GEMMA_MODEL` | Model id, for example `gemma-4-26b-a4b-it` |
+| `PRIMARY_MODEL` | Chat model, for example `gemini-3.8-flash` (the older name `GEMMA_MODEL` still works) |
+| `FALLBACK_MODEL` | Used after a 429/5xx from the primary, for example `gemini-3.6-flash` |
+| `LIGHT_MODEL` | Short helper calls (suggestions, memory), for example `gemini-3.5-flash-lite` |
+| `GEMINI_THINKING` / `GEMMA_THINKING` | Thinking level: Gemini `low`/`medium`/`high`; Gemma `minimal` (off) or `high` |
 | `ALLOWED_ORIGINS` | Comma-separated browser origins |
 
 Passwords that contain characters such as `@`, `#`, or `%` can be stored raw in `DATABASE_URL`. The app percent-encodes the userinfo before opening the pool, drops libpq-only query parameters such as `sslmode` (asyncpg rejects them), and disables asyncpg's prepared-statement cache (`statement_cache_size=0`) for the Supabase pooler. The connection is encrypted the same way as Supabase's `sslmode=require`: TLS is required, and the pooler certificate chain is not verified, which is what lets the session pooler connect from Windows.
