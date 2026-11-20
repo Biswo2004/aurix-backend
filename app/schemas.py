@@ -62,6 +62,8 @@ class ChatRequest(BaseModel):
     message: str
     use_files: bool = True
     user_name: str | None = Field(default=None, max_length=80)
+    # Time of day on the user's device, used only to word the greeting.
+    part_of_day: Literal["morning", "afternoon", "evening", "night"] | None = None
 
 
 class FeedbackIn(BaseModel):
