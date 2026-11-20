@@ -82,6 +82,12 @@ def sse(payload: dict[str, Any]) -> str:
     return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
 
+def get_helper_model() -> str:
+    """Model for short helper calls (suggestions, memory): the fallback model if set, else the primary."""
+    settings = get_settings()
+    return settings.FALLBACK_MODEL or settings.GEMMA_MODEL
+
+
 def get_genai_client() -> genai.Client:
     return genai.Client(api_key=get_settings().GOOGLE_API_KEY)
 
@@ -194,13 +200,15 @@ async def _stream_model_text(contents: list[Any], user_name: str | None = None) 
         system_instruction=system_instruction_for(user_name),
         temperature=0.3,
     )
-    delay = 1.0
+    delay = 0.5
     emitted = False
     for attempt in range(4):
+        # First try the primary model; after a 429/5xx switch to the fallback model (if configured).
+        model = settings.GEMMA_MODEL if attempt == 0 or not settings.FALLBACK_MODEL else settings.FALLBACK_MODEL
         try:
             stream = await _await_maybe(
                 client.aio.models.generate_content_stream(
-                    model=settings.GEMMA_MODEL,
+                    model=model,
                     contents=contents,
                     config=config,
                 )
@@ -214,9 +222,9 @@ async def _stream_model_text(contents: list[Any], user_name: str | None = None) 
             return
         except Exception as exc:
             if emitted or not is_retryable(exc) or attempt >= 3:
-                logger.warning("gemini stream failed status=%s", _status_of(exc))
+                logger.warning("gemini stream failed model=%s status=%s", model, _status_of(exc))
                 raise LLMError("AURIX AI is busy right now. Please try again in a moment.") from exc
-            logger.warning("gemini stream retry attempt=%s status=%s", attempt + 1, _status_of(exc))
+            logger.warning("gemini stream retry attempt=%s model=%s status=%s", attempt + 1, model, _status_of(exc))
             await asyncio.sleep(delay)
             delay *= 2
 
@@ -237,7 +245,7 @@ async def _suggestion_text(question: str, answer: str) -> str:
     async def _call() -> str:
         result = await _await_maybe(
             client.aio.models.generate_content(
-                model=settings.GEMMA_MODEL,
+                model=get_helper_model(),
                 contents=contents,
                 config=config,
             )

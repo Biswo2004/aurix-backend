@@ -77,13 +77,15 @@ class Settings(BaseSettings):
     GOOGLE_API_KEY: str = Field(min_length=1)
     GEMMA_MODEL: str = Field(min_length=1)
     ALLOWED_ORIGINS: str = Field(min_length=1)
+    # Optional second model used when the primary model returns 503/429, and for helper calls.
+    FALLBACK_MODEL: str = ""
 
     @field_validator("SUPABASE_URL")
     @classmethod
     def _strip_url(cls, value: str) -> str:
         return value.strip().rstrip("/")
 
-    @field_validator("DATABASE_URL", "GOOGLE_API_KEY", "GEMMA_MODEL", "ALLOWED_ORIGINS")
+    @field_validator("DATABASE_URL", "GOOGLE_API_KEY", "GEMMA_MODEL", "ALLOWED_ORIGINS", "FALLBACK_MODEL")
     @classmethod
     def _strip_value(cls, value: str) -> str:
         return value.strip()

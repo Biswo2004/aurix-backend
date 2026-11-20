@@ -39,7 +39,7 @@ async def _generate_fact_text(user_message: str, assistant_message: str) -> str:
 
     async def _call() -> str:
         result = client.aio.models.generate_content(
-            model=settings.GEMMA_MODEL,
+            model=llm_service.get_helper_model(),
             contents=contents,
             config=config,
         )
